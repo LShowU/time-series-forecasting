@@ -4,7 +4,7 @@ from pathlib import Path
 import pandas as pd
 
 from generate_data import save_data
-from train import fit_model, forecast, rolling_evaluate
+from train import (backtest_predictions, compare_models, fit_model, forecast, prediction_intervals, residual_diagnostics, rolling_evaluate)
 
 ROOT = Path(__file__).resolve().parent
 DATA_PATH = ROOT / "data" / "demand.csv"
@@ -62,11 +62,20 @@ def main() -> None:
     def evaluate(frame: pd.DataFrame, model: str, train_days: int, test_days: int, step_days: int) -> pd.DataFrame:
         return rolling_evaluate(frame, model, 24 * train_days, 24 * test_days, 24 * step_days)
 
+    @st.cache_data
+    def leaderboard(frame: pd.DataFrame, train_days: int, test_days: int, step_days: int) -> pd.DataFrame:
+        return compare_models(frame, ("seasonal_naive", "linear", "random_forest"), 24 * train_days, 24 * test_days, 24 * step_days)
+
+    @st.cache_data
+    def residuals(frame: pd.DataFrame, model: str, train_days: int, test_days: int, step_days: int) -> pd.DataFrame:
+        return backtest_predictions(frame, model, 24 * train_days, 24 * test_days, 24 * step_days)
+
     data = load_data(str(DATA_PATH))
     with st.sidebar:
         st.header("Forecast controls")
-        model_name = st.selectbox("Model", ["linear", "random_forest"])
+        model_name = st.selectbox("Model", ["seasonal_naive", "linear", "random_forest"])
         horizon = st.slider("Forecast horizon (hours)", 24, 24 * 14, 24 * 7, 24)
+        coverage = st.slider("Prediction interval coverage", 0.5, 0.99, 0.90, 0.01)
         train_days = st.slider("Initial train window (days)", 14, 120, 30)
         test_days = st.slider("Backtest window (days)", 1, 14, 7)
         step_days = st.slider("Backtest step (days)", 1, 14, 7)
@@ -81,11 +90,15 @@ def main() -> None:
         future = pd.DataFrame({"timestamp": future_times, "temperature": latest.get("temperature", 0), "precipitation": latest.get("precipitation", 0)})
         future["is_weekend"] = future.timestamp.dt.dayofweek.ge(5).astype(int)
         prediction = forecast(model, data, future)
+        calibration = residuals(data, model_name, train_days, test_days, step_days)
+        interval = prediction_intervals(prediction["prediction"], calibration["residual"], coverage)
+        prediction[["lower", "upper"]] = interval[["lower", "upper"]].to_numpy()
     except ValueError as exc:
         st.error(str(exc))
         st.stop()
 
     st.markdown('<div class="section-title">Model performance</div><div class="section-note">Mean error across chronological rolling windows</div>', unsafe_allow_html=True)
+    average = scores[["MAE", "RMSE", "MAPE", "SMAPE"]].mean()
     cols = st.columns(4)
     for col, label, fmt in zip(cols, ["MAE", "RMSE", "MAPE", "SMAPE"], ["{:.2f}", "{:.2f}", "{:.2f}%", "{:.2f}%"]):
         col.metric(label, fmt.format(average[label]))
@@ -93,11 +106,16 @@ def main() -> None:
     history = data.tail(min(len(data), 24 * 30)).rename(columns={"demand": "value"})[["timestamp", "value"]]
     future_plot = prediction.rename(columns={"prediction": "value"})[["timestamp", "value"]]
     chart_data = pd.concat([history.assign(series="Observed"), future_plot.assign(series="Forecast")])
-    st.markdown('<div class="section-title">Demand timeline</div><div class="section-note">Observed demand and recursive forecast for the selected horizon</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Model leaderboard</div><div class="section-note">All candidates evaluated on identical rolling windows; lower errors are better.</div>', unsafe_allow_html=True)
+    st.dataframe(leaderboard(data, train_days, test_days, step_days), use_container_width=True, hide_index=True)
+
+    st.markdown('<div class="section-title">Demand timeline</div><div class="section-note">Observed demand, forecast, and residual-quantile prediction interval</div>', unsafe_allow_html=True)
     if chart_data.empty:
         st.markdown('<div class="empty">No timeline data is available for this configuration.</div>', unsafe_allow_html=True)
     else:
         fig = px.line(chart_data, x="timestamp", y="value", color="series", title=None, color_discrete_map={"Observed":"#198f88", "Forecast":"#4655a8"})
+        fig.add_scatter(x=prediction["timestamp"], y=prediction["lower"], mode="lines", line=dict(width=0), showlegend=False, name="Lower bound")
+        fig.add_scatter(x=prediction["timestamp"], y=prediction["upper"], mode="lines", line=dict(width=0), fill="tonexty", fillcolor="rgba(70,85,168,.16)", name=f"{coverage:.0%} interval")
         fig.update_layout(height=390, margin=dict(l=10,r=10,t=20,b=10), plot_bgcolor="#ffffff", paper_bgcolor="#ffffff", legend_title_text="", hovermode="x unified")
         fig.update_xaxes(showgrid=False, title=None)
         fig.update_yaxes(gridcolor="#edf2f2", title="Demand")
@@ -109,11 +127,18 @@ def main() -> None:
         if prediction.empty:
             st.markdown('<div class="empty">No forecast rows yet. Increase the horizon or check the data file.</div>', unsafe_allow_html=True)
         else:
-            st.dataframe(prediction[["timestamp", "prediction"]], use_container_width=True, hide_index=True, height=300)
+            st.dataframe(prediction[["timestamp", "prediction", "lower", "upper"]], use_container_width=True, hide_index=True, height=300)
             st.download_button("Download forecast CSV", prediction.to_csv(index=False), "forecast.csv", "text/csv")
     with right:
         st.markdown('<div class="section-title">Run configuration</div>', unsafe_allow_html=True)
         st.markdown(f'<div class="meta-strip"><b>Training window</b><br>{train_days} days<br><br><b>Backtest window</b><br>{test_days} days<br><br><b>Step</b><br>{step_days} days</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="section-title">Residual diagnostics</div><div class="section-note">Backtest residual calibration and lag-1 dependence</div>', unsafe_allow_html=True)
+    diag = residual_diagnostics(calibration["residual"])
+    st.dataframe(pd.DataFrame([diag]).round(3), use_container_width=True, hide_index=True)
+    residual_fig = px.histogram(calibration, x="residual", nbins=30, title=None, color_discrete_sequence=["#d97745"])
+    residual_fig.update_layout(height=220, margin=dict(l=10,r=10,t=10,b=10), plot_bgcolor="#ffffff", paper_bgcolor="#ffffff", xaxis_title="Actual - forecast", yaxis_title="Count")
+    st.plotly_chart(residual_fig, use_container_width=True)
 
     st.markdown('<div class="section-title">Backtest diagnostics</div><div class="section-note">Window-level error helps reveal model stability over time</div>', unsafe_allow_html=True)
     if scores.empty:
